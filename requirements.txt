@@ -5,3 +5,4 @@ kagglehub
 python-dotenv
 matplotlib
 seaborn
+scikit-learn

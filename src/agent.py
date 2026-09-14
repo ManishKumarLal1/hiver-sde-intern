@@ -1,0 +1,280 @@
+"""
+AI support agent for AmazonHelp.
+
+Pipeline:
+  1. Classify intent using LLM (few-shot, 9 intents)
+  2. Retrieve top-3 similar historical messages + brand replies
+  3. Decide escalation + reason using LLM + retrieval context
+  4. Generate grounded reply using LLM + retrieved examples
+
+Writes predictions to predictions/agent.csv in the standard schema.
+"""
+import os
+import re
+import json
+import time
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from dotenv import load_dotenv
+from openai import OpenAI
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+load_dotenv()
+
+ROOT = Path(__file__).resolve().parent.parent
+GOLDEN = ROOT / 'golden_set' / 'golden_set_to_review.csv'
+POOL = ROOT / 'data' / 'processed' / 'pairs_cleaned_full.csv'
+OUT = ROOT / 'predictions' / 'agent.csv'
+
+MODEL = "openai/gpt-oss-safeguard-20b"
+SLEEP = 10.0
+MAX_RETRIES = 5
+
+INTENTS = ['order_status', 'refund_return', 'product_issue', 'account_access',
+           'billing_payment', 'cancellation', 'complaint', 'info_request', 'other']
+REASONS = ['low_risk', 'deterministic_action', 'security_sensitive', 'financial_risk',
+           'high_emotion', 'high_value', 'repeat_failure', 'legal_threat',
+           'safety_issue', 'kb_unavailable']
+
+INTENT_PROMPT = """You classify AmazonHelp customer support tweets.
+
+Pick EXACTLY ONE intent from:
+{intents}
+
+Priority order — stop at the first match:
+1. Fragment/thanks/off-topic, no ask → other
+2. Venting without an actionable ask → complaint
+3. Pre-purchase or general question, no active issue → info_request
+4. Cancel order/sub/account → cancellation
+5. Wants money back / return / replacement → refund_return
+6. Wrong charge / duplicate charge / payment failure / unauthorised TRANSACTION → billing_payment
+7. Item broken / wrong / device/service malfunctioning → product_issue
+8. Cannot log in / locked / hacked / password reset trouble (with an access ask) → account_access
+9. Delivery status / tracking / late / missing package → order_status
+
+CRITICAL:
+- Do NOT use account_access just because the message says "login", "account", "password"
+- Do NOT use order_status just because the message mentions delivery — check if there's a delivery ask
+- Sarcasm is a complaint signal
+- If a specific product is mentioned with a delivery issue → order_status
+- If a message has multiple issues, pick the highest priority (see the order above)
+
+Return only JSON: {{"intent": "<intent>", "confidence": <0-1>, "reasoning": "<short>"}}"""
+
+ESCALATION_PROMPT = """You are deciding whether an AmazonHelp support tweet should be auto-handled or escalated to a human.
+
+Intent: {intent}
+Customer message: {message}
+Retrieved similar examples (from historical brand responses):
+{examples}
+
+Escalation policy:
+- account_access → ALWAYS escalate (security-sensitive)
+- billing_payment → ALWAYS escalate (financial risk)
+- complaint → ALWAYS escalate (high emotion)
+- order_status → auto_handle unless "delivered but not received" or high value
+- refund_return → auto_handle unless >1000 or repeat failure
+- product_issue → auto_handle unless safety/repeat/high value
+- cancellation → auto_handle unless retention/legal
+- info_request → auto_handle
+- other → auto_handle
+
+Reason tags (pick one):
+low_risk, deterministic_action, security_sensitive, financial_risk, high_emotion,
+high_value, repeat_failure, legal_threat, safety_issue, kb_unavailable
+
+Return only JSON: {{"escalation": "auto_handle"|"escalate", "reason": "<tag>"}}"""
+
+REPLY_PROMPT = """You are a support agent for AmazonHelp, drafting a reply to a customer tweet.
+
+Customer message: {message}
+Detected intent: {intent}
+Escalation: {escalation} ({reason})
+
+Here are similar historical customer messages and the brand's replies, to ground your tone and content:
+{examples}
+
+Write a professional, empathetic reply (2-4 sentences, Twitter-appropriate).
+- Do not make up order numbers or promises.
+- If escalation is needed, invite the customer to a private channel (DM/phone).
+- Match AmazonHelp's tone: brief, apologetic when warranted, action-oriented.
+- Don't repeat the customer's insult back. Don't over-apologize.
+
+Return only JSON: {{"reply": "<reply text>"}}"""
+
+def build_retrieval():
+    pool = pd.read_csv(POOL)
+    pool = pool.dropna(subset=['customer_msg_clean', 'brand_reply_clean'])
+    pool = pool[pool['brand_reply_clean'].astype(str).str.strip() != '']
+    pool = pool[pool['customer_msg_clean'].astype(str).str.strip() != ''].reset_index(drop=True)
+
+    vec = TfidfVectorizer(max_features=8000, ngram_range=(1, 2), min_df=2)
+    X = vec.fit_transform(pool['customer_msg_clean'].astype(str))
+    return pool, vec, X
+
+
+def retrieve(pool, vec, X, msg, k=3):
+    if not isinstance(msg, str) or not msg.strip():
+        return []
+    q = vec.transform([msg])
+    sims = (X @ q.T).toarray().ravel()
+    idx = np.argsort(-sims)[:k]
+    return [{
+        'customer': str(pool.iloc[i]['customer_msg_clean']),
+        'reply': str(pool.iloc[i]['brand_reply_clean']),
+        'score': float(sims[i]),
+    } for i in idx]
+
+
+def extract_json(text):
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+    return text
+
+
+def llm_json(client, prompt, model=MODEL):
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0,
+            )
+            return json.loads(extract_json(r.choices[0].message.content))
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate" in err.lower():
+                wait = SLEEP * (attempt + 2)
+                print(f"  rate-limited, waiting {wait:.0f}s")
+                time.sleep(wait)
+            else:
+                print(f"  err: {err[:120]}")
+                time.sleep(SLEEP)
+    raise RuntimeError("LLM call failed after all retries")   # <-- never returns {}
+
+COMBINED_PROMPT = """You are an AmazonHelp support agent. Given a customer tweet, do all three tasks in one response.
+
+Customer message: {message}
+Intent definitions (pick exactly one):
+- order_status: delivery/tracking/late/missing package
+- refund_return: refund/return/replacement requested
+- product_issue: broken item or malfunctioning device/service
+- account_access: login, password, locked, hacked (with an access ask)
+- billing_payment: wrong charge, duplicate, payment failure
+- cancellation: cancel order/sub/account
+- complaint: venting, no actionable ask
+- info_request: pre-purchase or general question
+- other: thanks, fragments, off-topic
+
+Escalation policy:
+- account_access, billing_payment, complaint → ALWAYS escalate
+- order_status → auto unless "delivered but not received" or high value
+- refund_return → auto unless disputed or >1000
+- product_issue → auto unless safety/repeat/high value
+- cancellation → auto unless retention/legal
+- info_request, other → auto
+
+Reason tags: low_risk, deterministic_action, security_sensitive, financial_risk,
+high_emotion, high_value, repeat_failure, legal_threat, safety_issue, kb_unavailable
+
+Here are similar historical customer messages and the brand's replies (for grounding):
+{examples}
+
+Return ONLY valid JSON:
+{{
+  "intent": "<intent>",
+  "escalation": "auto_handle" or "escalate",
+  "reason": "<tag>",
+  "reply": "<2-4 sentence professional reply>"
+}}"""
+
+
+def run_agent(limit=None):
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise SystemExit("GROQ_API_KEY not set")
+    client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+
+    golden = pd.read_csv(GOLDEN, keep_default_na=False, na_values=[''])
+    golden = golden[golden['intent'] != ''].copy()
+    if limit:
+        golden = golden.head(limit)
+
+    # Resume
+    done_ids = set()
+    existing_rows = []
+    if OUT.exists():
+        try:
+            prev = pd.read_csv(OUT, keep_default_na=False, na_values=[''])
+            prev = prev[prev['predicted_intent'].astype(str).str.strip() != '']
+            done_ids = set(prev['id'].tolist())
+            existing_rows = prev.to_dict('records')
+            print(f"Resuming — {len(done_ids)} rows already done")
+        except Exception as e:
+            print(f"Could not load previous predictions ({e}); starting fresh")
+
+    remaining = golden[~golden['id'].isin(done_ids)].copy()
+    print(f"Running agent on {len(remaining)} remaining rows (of {len(golden)})")
+
+    pool, pool_vec, pool_X = build_retrieval()
+
+    rows = list(existing_rows)
+    for i, (_, row) in enumerate(remaining.iterrows(), 1):
+        msg = str(row['customer_msg_clean'])
+        try:
+            # Retrieve examples
+            examples = retrieve(pool, pool_vec, pool_X, msg, k=3)
+            examples_str = "\n".join(
+                f"- Customer: {e['customer'][:120]}\n  Brand reply: {e['reply'][:180]}"
+                for e in examples
+            ) or "(no close examples found)"
+
+            # SINGLE LLM call
+            out = llm_json(client, COMBINED_PROMPT.format(
+                message=msg, examples=examples_str))
+
+            intent = out.get('intent', 'other')
+            if intent not in INTENTS:
+                intent = 'other'
+            escalation = out.get('escalation', 'auto_handle')
+            if escalation not in ('auto_handle', 'escalate'):
+                escalation = 'auto_handle'
+            reason = out.get('reason', 'low_risk')
+            if reason not in REASONS:
+                reason = 'low_risk'
+            reply = out.get('reply', '')
+
+            rows.append({
+                'id': row['id'],
+                'predicted_intent': intent,
+                'predicted_escalation': escalation,
+                'predicted_reason': reason,
+                'predicted_reply': reply,
+            })
+            print(f"  [{i}/{len(remaining)}] id={row['id']} → {intent} / {escalation} / {reason}")
+            pd.DataFrame(rows).to_csv(OUT, index=False)
+
+            time.sleep(1.0)  # 1 call per row → can afford shorter sleep
+
+        except KeyboardInterrupt:
+            print(f"\nInterrupted. Saved {len(rows)} rows.")
+            pd.DataFrame(rows).to_csv(OUT, index=False)
+            return
+        except Exception as e:
+            print(f"  ⚠️  id={row['id']}: {e}")
+            time.sleep(3)
+            continue
+
+    out = pd.DataFrame(rows)
+    OUT.parent.mkdir(exist_ok=True)
+    out.to_csv(OUT, index=False)
+    print(f"\nDone. Saved {len(out)} predictions to {OUT}")
+
+
+if __name__ == '__main__':
+    import sys
+    limit = int(sys.argv[1]) if len(sys.argv) > 1 else None
+    run_agent(limit=limit)
